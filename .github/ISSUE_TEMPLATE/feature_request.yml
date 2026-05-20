@@ -1,0 +1,45 @@
+name: Feature Request
+description: Suggest a feature or improvement for the BookOrbit KOReader plugin
+title: "[Feature] "
+labels: ["feature"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What is your idea?
+      description: Describe the feature clearly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Explain the user or workflow pain this feature addresses.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context (optional)
+      description: Mockups, examples, alternatives, or implementation ideas.
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Want to help?
+      options:
+        - "Yes, I want to implement this"
+        - "I can help test and validate"
+        - "Just sharing the idea"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I've searched existing issues and this has not been requested yet.
+          required: true
