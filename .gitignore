@@ -90,3 +90,4 @@ artifacts/
 
 # VS Code test artifacts
 .vscode-test/
+.luarc.json
