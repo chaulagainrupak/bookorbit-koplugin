@@ -1,5 +1,8 @@
+local _ = require("gettext")
 return {
-    name = "bookorbit",
-    fullname = "BookOrbit",
-    description = "KoReader plugin for syncing books and reading statistics to BookOrbit web-ui",
+    name        = "bookorbit",
+    fullname    = _("BookOrbit"),
+    description = _("Sync reading statistics and progress to your BookOrbit server."),
 }
+
+-- Made with <3 by @chaulagainrupak - GitHub
