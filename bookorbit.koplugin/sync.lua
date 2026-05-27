@@ -139,7 +139,7 @@ local function syncProgress(books)
         local doc_key = (book.md5 and book.md5 ~= "") and book.md5
             or (book.file and book.file ~= "") and book.file
         if doc_key and book.pages and book.pages > 0 then
-            local ok, _, err = API.put("/api/progress", {
+            local ok, _, err = API.put("/api/v1/koreader/progress", {
                 document   = doc_key,
                 progress   = tostring(book.page or 0),
                 percentage = (book.page or 0) / book.pages,
@@ -190,7 +190,7 @@ local function syncStats(books, since)
         return { ok = true, label = "stats", count = 0 }
     end
 
-    local ok, _, err = API.post("/api/stats", {
+    local ok, _, err = API.post("/api/v1/koreader/stats", {
         since     = since,
         timestamp = os.time(),
         books     = payloads,
