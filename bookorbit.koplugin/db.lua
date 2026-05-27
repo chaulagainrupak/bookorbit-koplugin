@@ -54,7 +54,10 @@ function DB.getSessionsSince(since)
             p.page, p.start_time, p.duration, p.total_pages
         FROM   page_stat_data p
         JOIN   book b ON b.id = p.id_book
-        WHERE  p.start_time > %d
+        -- KOReader may flush rows to SQLite after BookOrbit already advanced
+        -- the sync cursor. Using (start + duration) avoids dropping sessions
+        -- that started before the cursor but ended after it.
+        WHERE  (p.start_time + p.duration) > %d
         ORDER  BY b.id, p.start_time ASC
     ]], cutoff))
 
@@ -64,7 +67,7 @@ function DB.getSessionsSince(since)
 
         if not book_meta[id_book] then
             book_meta[id_book] = {
-                id               = id_book,
+                id_book          = id_book,
                 md5              = row[2] or "",
                 title            = row[3] or "",
                 authors          = row[4] or "",
@@ -78,12 +81,24 @@ function DB.getSessionsSince(since)
             }
             rows_by_book[id_book] = {}
         end
-        rows_by_book[id_book][#rows_by_book[id_book] + 1] = {
-            page        = tonumber(row[11]) or 0,
-            start_time  = tonumber(row[12]) or 0,
-            duration    = tonumber(row[13]) or 0,
-            total_pages = tonumber(row[14]) or 0,
-        }
+        local page        = tonumber(row[11]) or 0
+        local start_time  = tonumber(row[12]) or 0
+        local duration    = tonumber(row[13]) or 0
+        local total_pages = tonumber(row[14]) or 0
+
+        -- KOReader stores some placeholder rows with zero values.
+        -- Skip invalid rows so one bad session cannot poison the whole payload.
+        if total_pages <= 0 then
+            total_pages = tonumber(row[5]) or 0
+        end
+        if page > 0 and start_time > 0 and duration > 0 and total_pages > 0 then
+            rows_by_book[id_book][#rows_by_book[id_book] + 1] = {
+                page        = page,
+                start_time  = start_time,
+                duration    = duration,
+                total_pages = total_pages,
+            }
+        end
     end
     stmt:close()
     conn:close()
@@ -122,7 +137,7 @@ function DB.getBookByTitle(title, authors)
     local book = nil
     for row in stmt:rows() do
         book = {
-            id               = tonumber(row[1]),
+            id_book          = tonumber(row[1]),
             md5              = row[2] or "",
             title            = row[3] or "",
             authors          = row[4] or "",
