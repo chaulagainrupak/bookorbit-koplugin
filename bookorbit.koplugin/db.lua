@@ -24,10 +24,8 @@ local function getConn()
     return conn
 end
 
--- rapidjson serialises an empty Lua table as {} (object).
--- Tagging it with the array metatable forces [].
 local function empty_array()
-    return json.array() -- rapidjson exposes this helper
+    return json.array()
 end
 
 function DB.isAvailable()
@@ -42,10 +40,13 @@ function DB.getSessionsSince(since)
     if not conn then return nil end
 
     local cutoff       = math.max(0, since - 5)
-
     local rows_by_book = {}
     local book_meta    = {}
 
+    -- KOReader statistics DB book table columns:
+    -- id, title, authors, notes, highlights, pages, series, language,
+    -- total_read_time, total_read_pages, md5, last_open
+    -- (no "file" column — file path is not stored in the stats DB)
     local stmt         = conn:prepare(string.format([[
         SELECT
             b.id, b.md5, b.title, b.authors, b.pages,
@@ -60,7 +61,6 @@ function DB.getSessionsSince(since)
 
     for row in stmt:rows() do
         local id_book = tonumber(row[1])
-
 
         if not book_meta[id_book] then
             book_meta[id_book] = {
@@ -78,23 +78,32 @@ function DB.getSessionsSince(since)
             }
             rows_by_book[id_book] = {}
         end
-        rows_by_book[id_book][#rows_by_book[id_book] + 1] = {
-            page        = tonumber(row[11]) or 0,
-            start_time  = tonumber(row[12]) or 0,
-            duration    = tonumber(row[13]) or 0,
-            total_pages = tonumber(row[14]) or 0,
-        }
+
+        local page        = tonumber(row[11]) or 0
+        local start_time  = tonumber(row[12]) or 0
+        local duration    = tonumber(row[13]) or 0
+        local total_pages = tonumber(row[14]) or 0
+
+        if page > 0 then
+            rows_by_book[id_book][#rows_by_book[id_book] + 1] = {
+                page        = page,
+                start_time  = start_time,
+                duration    = duration,
+                total_pages = total_pages,
+            }
+        end
     end
+
     stmt:close()
     conn:close()
 
     local books = {}
     for id_book, meta in pairs(book_meta) do
         local sessions     = rows_by_book[id_book]
-        -- tag empty tables so rapidjson serialises [] not {}
         meta.page_sessions = (#sessions > 0) and sessions or empty_array()
         books[#books + 1]  = meta
     end
+
     return books
 end
 
@@ -102,7 +111,6 @@ function DB.getBookByTitle(title, authors)
     local conn = getConn()
     if not conn then return nil end
 
-    -- escape single quotes
     local t = (title or ""):gsub("'", "''")
     local a = (authors or ""):gsub("'", "''")
 
@@ -120,6 +128,7 @@ function DB.getBookByTitle(title, authors)
     ]], where))
 
     local book = nil
+
     for row in stmt:rows() do
         book = {
             id               = tonumber(row[1]),
@@ -136,8 +145,10 @@ function DB.getBookByTitle(title, authors)
             page_sessions    = empty_array(),
         }
     end
+
     stmt:close()
     conn:close()
+
     return book
 end
 

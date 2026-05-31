@@ -16,6 +16,8 @@ local S      = require("settings")
 
 local API    = {}
 
+http.TIMEOUT = 15 -- don't hang forever
+
 local function headers()
     return {
         ["X-Auth-User"]  = S.getUsername(),
@@ -26,36 +28,40 @@ local function headers()
 end
 
 local function request(method, path, body_tbl)
-    local url                  = S.getServerURL() .. path
-    local body                 = body_tbl and json.encode(body_tbl) or ""
-    local hdrs                 = headers()
-    hdrs["Content-Length"]     = tostring(#body)
+    local url = S.getServerURL() .. path
+    local body = body_tbl and json.encode(body_tbl) or ""
+    local hdrs = headers()
+    hdrs["Content-Length"] = tostring(#body)
 
-    local chunks               = {}
-    local res, code, _, status = http.request({
+    local chunks = {}
+
+    local res, code, response_headers, status = http.request({
         url     = url,
         method  = method,
-        headers = hdrs,
         source  = ltn12.source.string(body),
+        headers = hdrs,
         sink    = ltn12.sink.table(chunks),
     })
 
-    -- res is nil on connection failure, the status line string on success
     if not res then
+        logger.warn("BookOrbit NETWORK ERROR: " .. tostring(code))
         return false, nil, "Network error: " .. tostring(code)
     end
 
-    local raw  = table.concat(chunks)
+    local raw = table.concat(chunks)
+
     local resp = nil
     if raw ~= "" then
-        local dok, dec = pcall(json.decode, raw)
-        if dok then resp = dec end
+        local ok, decoded = pcall(json.decode, raw)
+        if ok then
+            resp = decoded
+        else
+            logger.warn("BookOrbit: response is not valid JSON")
+        end
     end
 
     if code < 200 or code >= 300 then
-        local msg = "HTTP " .. code
-        if resp then msg = msg .. ": " .. (resp.error or resp.message or raw) end
-        return false, resp, msg
+        return false, resp, "HTTP " .. tostring(code) .. ": " .. tostring(raw)
     end
 
     return true, resp, nil
