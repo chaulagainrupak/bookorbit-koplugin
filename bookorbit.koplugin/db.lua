@@ -55,7 +55,10 @@ function DB.getSessionsSince(since)
             p.page, p.start_time, p.duration, p.total_pages
         FROM   page_stat_data p
         JOIN   book b ON b.id = p.id_book
-        WHERE  p.start_time > %d
+        -- KOReader may flush rows to SQLite after BookOrbit already advanced
+        -- the sync cursor. Using (start + duration) avoids dropping sessions
+        -- that started before the cursor but ended after it.
+        WHERE  (p.start_time + p.duration) > %d
         ORDER  BY b.id, p.start_time ASC
     ]], cutoff))
 
@@ -64,7 +67,7 @@ function DB.getSessionsSince(since)
 
         if not book_meta[id_book] then
             book_meta[id_book] = {
-                id               = id_book,
+                id_book          = id_book,
                 md5              = row[2] or "",
                 title            = row[3] or "",
                 authors          = row[4] or "",
@@ -131,7 +134,7 @@ function DB.getBookByTitle(title, authors)
 
     for row in stmt:rows() do
         book = {
-            id               = tonumber(row[1]),
+            id_book          = tonumber(row[1]),
             md5              = row[2] or "",
             title            = row[3] or "",
             authors          = row[4] or "",
