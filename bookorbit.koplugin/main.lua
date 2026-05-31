@@ -5,6 +5,7 @@ local MultiInputDialog = require("ui/widget/multiinputdialog")
 local SpinWidget       = require("ui/widget/spinwidget")
 local ConfirmBox       = require("ui/widget/confirmbox")
 local NetworkMgr       = require("ui/network/manager")
+local Notification     = require("ui/widget/notification")
 local _                = require("gettext")
 local T                = require("ffi/util").template
 local logger           = require("logger")
@@ -87,33 +88,42 @@ function BookOrbit:_runSync(full, silent)
     end
 
     NetworkMgr:runWhenOnline(function()
-        local results     = full and Sync.full(self.ui) or Sync.delta(self.ui)
+        if not silent then
+            -- toast renders immediately; user can keep using the device
+            UIManager:show(Notification:new { text = _("BookOrbit: syncing in background…") })
+        end
 
-        _pages_since_sync = 0
-        _session_start    = os.time()
-        S.setSessionStartTime(_session_start)
+        -- defer the actual work one tick so the toast paints first
+        UIManager:scheduleIn(0, function()
+            local results     = (full and Sync.full(self.ui) or Sync.delta(self.ui)) or {}
 
-        if silent then return end
+            _pages_since_sync = 0
+            _session_start    = os.time()
+            S.setSessionStartTime(_session_start)
 
-        local all_ok = true
-        for _, r in ipairs(results) do
-            if not r.ok then
-                all_ok = false; break
+            if silent then return end
+            if #results == 0 then return end
+
+            local all_ok = true
+            for _, r in ipairs(results) do
+                if not r.ok then
+                    all_ok = false; break
+                end
             end
-        end
 
-        local lines = {}
-        for _, r in ipairs(results) do
-            lines[#lines + 1] = (r.ok and "✓ " or "✗ ")
-                .. r.label .. " (" .. (r.count or 0) .. ")"
-                .. (r.err and "\n   " .. r.err or "")
-        end
+            local lines = {}
+            for _, r in ipairs(results) do
+                lines[#lines + 1] = (r.ok and "✓ " or "✗ ")
+                    .. r.label .. " (" .. (r.count or 0) .. ")"
+                    .. (r.err and "\n   " .. r.err or "")
+            end
 
-        if all_ok then
-            self:_notify(_("Sync complete.\n\n") .. table.concat(lines, "\n"))
-        else
-            self:_notify(_("Sync finished with errors.\n\n") .. table.concat(lines, "\n"), true)
-        end
+            if all_ok then
+                self:_notify(_("Sync complete.\n\n") .. table.concat(lines, "\n"))
+            else
+                self:_notify(_("Sync finished with errors.\n\n") .. table.concat(lines, "\n"), true)
+            end
+        end)
     end)
 end
 
@@ -192,7 +202,7 @@ function BookOrbit:addToMainMenu(menu_items)
                 text     = _("Full sync — resend all reading history"),
                 callback = function()
                     UIManager:show(ConfirmBox:new {
-                        text        = _("This will resend all reading records to BookOrbit to rebuild your server history. This may take a while and could temporarily slow down your device."),
+                        text        = _("This will resend all reading records to BookOrbit to rebuild your server history. This may take a while and could temporarily slow down your device. After confirmation the sync will continue in background"),
                         ok_text     = _("Run full sync"),
                         ok_callback = function() self:_runSync(true, false) end,
                     })

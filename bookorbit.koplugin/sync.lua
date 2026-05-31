@@ -3,12 +3,14 @@
 
     All sync paths (full, delta, tick) go through ONE function: _doSync(ui, since).
 
-    POST /api/stats payload per book:
-        id_book, md5, document, title, authors, pages, last_open,
-        notes, highlights, total_read_secs, total_read_mins, total_read_pages,
-        page_sessions: [ { page, start_time, duration, total_pages } ]
+    POST /api/v1/koreader/stats payload:
+        since, timestamp, device, books: [
+            { id_book, md5, document, title, authors, pages, last_open,
+              notes, highlights, total_read_secs, total_read_mins, total_read_pages,
+              page_sessions: [ { page, start_time, duration, total_pages } ] }
+        ]
 
-    PUT /api/progress payload per book:
+    PUT /api/v1/koreader/syncs/progress payload per book:
         document, progress, percentage, device
 --]]
 
@@ -21,6 +23,7 @@ local DocSettings = require("docsettings")
 local json        = require("rapidjson")
 
 local Sync        = {}
+local _syncing    = false -- prevent concurrent syncs
 
 
 local function getBooksFromHistory(since)
@@ -57,19 +60,24 @@ end
 
 
 local function getBooks(since)
+    logger.info("BookOrbit: DB available = " .. tostring(DB.isAvailable()))
+
     if DB.isAvailable() then
         local books = DB.getSessionsSince(since)
+
+        logger.info("BookOrbit: DB returned "
+            .. tostring(books and #books or -1) .. " books")
+
         if books and #books > 0 then
             return books
         end
-        -- DB is available but no page_stat_data rows in window yet
-        -- that's fine, mergeOpenDoc will inject the open doc with fresh
-        -- totals looked up by title
+
         if since > 0 then
             return {}
         end
     end
-    logger.warn("BookOrbit: stats DB unavailable, falling back to ReadHistory")
+
+    logger.warn("BookOrbit: FALLING BACK TO READHISTORY")
     return getBooksFromHistory(since)
 end
 
@@ -104,7 +112,6 @@ local function mergeOpenDoc(ui, books)
     if db_book then
         db_book.file = file
         db_book.page = page
-        -- pages from live doc is more reliable than DB for an open file
         if doc.getPageCount then
             local pc = doc:getPageCount()
             if pc and pc > 0 then db_book.pages = pc end
@@ -139,7 +146,7 @@ local function syncProgress(books)
         local doc_key = (book.md5 and book.md5 ~= "") and book.md5
             or (book.file and book.file ~= "") and book.file
         if doc_key and book.pages and book.pages > 0 then
-            local ok, _, err = API.put("/api/v1/koreader/progress", {
+            local ok, _, err = API.put("/api/v1/koreader/syncs/progress", {
                 document   = doc_key,
                 progress   = tostring(book.page or 0),
                 percentage = (book.page or 0) / book.pages,
@@ -149,7 +156,7 @@ local function syncProgress(books)
                 sent = sent + 1
             else
                 failed = failed + 1
-                logger.warn("BookOrbit: progress failed for " .. doc_key
+                logger.warn("BookOrbit: progress failed for " .. tostring(doc_key)
                     .. ": " .. tostring(err))
             end
         end
@@ -162,56 +169,85 @@ local function syncProgress(books)
     }
 end
 
+
 local function syncStats(books, since)
-    local payloads = {}
+    local sent, failed, skipped = 0, 0, 0
+
     for _, book in ipairs(books) do
         local doc_key = (book.md5 and book.md5 ~= "") and book.md5
             or (book.file and book.file ~= "") and book.file
-        if doc_key then
-            payloads[#payloads + 1] = {
-                id_book          = book.id_book,
-                md5              = book.md5 or "",
-                document         = doc_key,
-                title            = book.title or "",
-                authors          = book.authors or "",
-                pages            = book.pages or 0,
-                last_open        = book.last_open or os.time(),
-                notes            = book.notes or 0,
-                highlights       = book.highlights or 0,
-                total_read_secs  = book.total_read_secs or 0,
-                total_read_mins  = book.total_read_mins or 0,
-                total_read_pages = book.total_read_pages or 0,
-                page_sessions    = book.page_sessions or json.array(),
-            }
+
+        if not doc_key then
+            skipped = skipped + 1
+            logger.warn("BookOrbit: skipping book with no md5 or file: "
+                .. tostring(book.title))
+        else
+            local ok, resp, err = API.post("/api/v1/koreader/stats", {
+                since     = since,
+                timestamp = os.time(),
+                device    = S.getUsername(),
+                books     = {
+                    {
+                        document         = book.md5 or doc_key,
+                        md5              = book.md5 or "",
+                        title            = book.title or "",
+                        authors          = book.authors or "",
+                        pages            = book.pages or 0,
+                        last_open        = book.last_open or os.time(),
+                        notes            = book.notes or 0,
+                        highlights       = book.highlights or 0,
+                        total_read_secs  = book.total_read_secs or 0,
+                        total_read_mins  = book.total_read_mins or 0,
+                        total_read_pages = book.total_read_pages or 0,
+                        page_sessions    = book.page_sessions or json.array(),
+                    }
+                },
+            })
+
+            if ok then
+                sent = sent + 1
+                logger.info("BookOrbit: sent [" .. tostring(book.title) .. "]")
+            else
+                failed = failed + 1
+                logger.warn("BookOrbit: FAILED [" .. tostring(book.title)
+                    .. "] " .. tostring(err))
+            end
         end
     end
 
-    if #payloads == 0 then
-        return { ok = true, label = "stats", count = 0 }
+    if skipped > 0 then
+        logger.warn("BookOrbit: skipped " .. skipped .. " book(s) with no document key")
     end
 
-    local ok, _, err = API.post("/api/v1/koreader/stats", {
-        since     = since,
-        timestamp = os.time(),
-        books     = payloads,
-    })
+    logger.info(string.format(
+        "BookOrbit: stats done — sent=%d failed=%d skipped=%d",
+        sent, failed, skipped))
+
     return {
-        ok    = ok,
+        ok    = failed == 0,
         label = "stats",
-        count = ok and #payloads or 0,
-        err   = err,
+        count = sent,
+        err   = failed > 0 and (failed .. " failed") or nil,
     }
 end
 
-
 local function _doSync(ui, since)
-    local books = getBooks(since)
-    books       = mergeOpenDoc(ui, books)
+    if _syncing then
+        logger.info("BookOrbit: sync already in progress, skipping")
+        return { { ok = true, label = "skipped (busy)", count = 0 } }
+    end
+    _syncing    = true
+    local books = getBooks(since) or {}
+    books       = mergeOpenDoc(ui, books) or {}
     if #books == 0 then
+        logger.info("BookOrbit: nothing to sync")
+        _syncing = false
         return { { ok = true, label = "up to date", count = 0 } }
     end
+    logger.info("BookOrbit: syncing " .. #books .. " book(s)")
     local results = { syncProgress(books), syncStats(books, since) }
     S.setLastSync(os.time())
+    _syncing = false
     return results
 end
 
