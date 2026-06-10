@@ -22,6 +22,8 @@ local BookOrbit         = WidgetContainer:extend {
 -- per-session counters (reset on book open / after sync)
 local _pages_since_sync = 0
 local _session_start    = os.time()
+local _tick_in_flight   = false   -- prevents stacking auto-sync triggers
+local _last_tick_time   = 0       -- unix time of last auto-sync dispatch
 
 
 function BookOrbit:init()
@@ -38,6 +40,8 @@ end
 function BookOrbit:onReaderReady()
     _pages_since_sync = 0
     _session_start    = os.time()
+    _tick_in_flight   = false
+    _last_tick_time   = 0
     S.setSessionStartTime(_session_start)
 end
 
@@ -53,15 +57,47 @@ end
 
 function BookOrbit:onPageUpdate()
     _pages_since_sync = _pages_since_sync + 1
-    local mins = (os.time() - _session_start) / 60
-    Sync.onReadingTick(self.ui, _pages_since_sync, mins)
-    -- counters reset after a sync fires (Sync.tick = Sync.delta, resets last_sync)
-    -- but we reset local counters here so thresholds don't re-trigger immediately
-    if S.getLastSync() > _session_start then
+    local now  = os.time()
+    local mins = (now - _session_start) / 60
+
+    -- don't stack auto-syncs: skip if one is already in flight or fired < 30s ago
+    if _tick_in_flight then return end
+    if (now - _last_tick_time) < 30 then return end
+
+    local page_due = S.getPageThreshold() > 0 and _pages_since_sync >= S.getPageThreshold()
+    local min_due  = S.getMinuteThreshold() > 0 and mins >= S.getMinuteThreshold()
+    if not (page_due or min_due) then return end
+
+    _tick_in_flight = true
+    _last_tick_time = now
+    logger.info("BookOrbit: auto-sync trigger (pages=" .. _pages_since_sync
+        .. " mins=" .. string.format("%.1f", mins) .. ")")
+
+    -- Build a live session record for the current book so the stats payload
+    -- has real page_sessions even before KOReader flushes to SQLite.
+    local live_session = nil
+    if self.ui and self.ui.document then
+        local page = 0
+        if self.ui.paging and self.ui.paging.current_page then
+            page = self.ui.paging.current_page
+        elseif self.ui.rolling and self.ui.rolling.current_page then
+            page = self.ui.rolling.current_page
+        end
+        live_session = {
+            start_time  = _session_start,
+            duration    = now - _session_start,
+            page        = page,
+            total_pages = (self.ui.document.getPageCount
+                and self.ui.document:getPageCount()) or 0,
+        }
+    end
+
+    Sync.tick(self.ui, function(results)
+        _tick_in_flight   = false
         _pages_since_sync = 0
         _session_start    = os.time()
         S.setSessionStartTime(_session_start)
-    end
+    end, live_session)
 end
 
 function BookOrbit:_runSync(full, silent)
@@ -89,14 +125,11 @@ function BookOrbit:_runSync(full, silent)
 
     NetworkMgr:runWhenOnline(function()
         if not silent then
-            -- toast renders immediately; user can keep using the device
             UIManager:show(Notification:new { text = _("BookOrbit: syncing in background…") })
         end
 
-        -- defer the actual work one tick so the toast paints first
-        UIManager:scheduleIn(0, function()
-            local results     = (full and Sync.full(self.ui) or Sync.delta(self.ui)) or {}
-
+        local self_ref = self
+        local function on_done(results)
             _pages_since_sync = 0
             _session_start    = os.time()
             S.setSessionStartTime(_session_start)
@@ -106,9 +139,7 @@ function BookOrbit:_runSync(full, silent)
 
             local all_ok = true
             for _, r in ipairs(results) do
-                if not r.ok then
-                    all_ok = false; break
-                end
+                if not r.ok then all_ok = false; break end
             end
 
             local lines = {}
@@ -119,11 +150,17 @@ function BookOrbit:_runSync(full, silent)
             end
 
             if all_ok then
-                self:_notify(_("Sync complete.\n\n") .. table.concat(lines, "\n"))
+                self_ref:_notify(_("Sync complete.\n\n") .. table.concat(lines, "\n"))
             else
-                self:_notify(_("Sync finished with errors.\n\n") .. table.concat(lines, "\n"), true)
+                self_ref:_notify(_("Sync finished with errors.\n\n") .. table.concat(lines, "\n"), true)
             end
-        end)
+        end
+
+        if full then
+            Sync.full(self.ui, on_done)
+        else
+            Sync.delta(self.ui, on_done)
+        end
     end)
 end
 

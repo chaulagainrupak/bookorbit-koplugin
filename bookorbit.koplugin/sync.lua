@@ -20,10 +20,11 @@ local DB          = require("db")
 local logger      = require("logger")
 local ReadHistory = require("readhistory")
 local DocSettings = require("docsettings")
+local UIManager   = require("ui/uimanager")
 local json        = require("rapidjson")
 
 local Sync        = {}
-local _syncing    = false -- prevent concurrent syncs
+local _syncing    = false
 
 
 local function getBooksFromHistory(since)
@@ -82,7 +83,7 @@ local function getBooks(since)
 end
 
 
-local function mergeOpenDoc(ui, books)
+local function mergeOpenDoc(ui, books, live_session)
     if not ui or not ui.document then return books end
     local doc   = ui.document
     local props = doc:getProps() or {}
@@ -95,16 +96,34 @@ local function mergeOpenDoc(ui, books)
         page = ui.rolling.current_page
     end
 
-    -- 1. already in list?
+    local function inject(b)
+        b.page = page
+        b.file = file
+        -- splice live session in if DB hasn't flushed it yet
+        if live_session then
+            local sessions = b.page_sessions
+            -- avoid duplicate: don't add if DB already has a session at same start_time
+            local already = false
+            for _, s in ipairs(sessions) do
+                if s.start_time == live_session.start_time then
+                    already = true; break
+                end
+            end
+            if not already then
+                sessions[#sessions + 1] = live_session
+            end
+            b.total_read_secs = b.total_read_secs + live_session.duration
+            b.total_read_mins = math.floor(b.total_read_secs / 60)
+        end
+    end
+
     for _, b in ipairs(books) do
         if b.file == file or (title ~= "" and b.title == title) then
-            b.page = page
-            b.file = file
+            inject(b)
             return books
         end
     end
 
-    -- 2. not in list — look up from DB by title
     local db_book = (DB.isAvailable() and title ~= "")
         and DB.getBookByTitle(title, props.authors or "")
         or nil
@@ -116,9 +135,15 @@ local function mergeOpenDoc(ui, books)
             local pc = doc:getPageCount()
             if pc and pc > 0 then db_book.pages = pc end
         end
+        if live_session then
+            db_book.page_sessions[#db_book.page_sessions + 1] = live_session
+            db_book.total_read_secs = db_book.total_read_secs + live_session.duration
+            db_book.total_read_mins = math.floor(db_book.total_read_secs / 60)
+        end
         table.insert(books, 1, db_book)
     else
-        -- 3. DB miss — minimal stub so progress PUT still fires
+        local sessions = json.array()
+        if live_session then sessions[1] = live_session end
         table.insert(books, 1, {
             id_book          = nil,
             md5              = "",
@@ -128,66 +153,79 @@ local function mergeOpenDoc(ui, books)
             page             = page,
             pages            = (doc.getPageCount and doc:getPageCount()) or 0,
             last_open        = os.time(),
-            total_read_secs  = 0,
-            total_read_mins  = 0,
+            total_read_secs  = live_session and live_session.duration or 0,
+            total_read_mins  = live_session and math.floor(live_session.duration / 60) or 0,
             total_read_pages = 0,
             highlights       = 0,
             notes            = 0,
-            page_sessions    = json.array(),
+            page_sessions    = sessions,
         })
     end
     return books
 end
 
 
-local function syncProgress(books)
-    local sent, failed = 0, 0
-    for _, book in ipairs(books) do
-        local doc_key = (book.md5 and book.md5 ~= "") and book.md5
-            or (book.file and book.file ~= "") and book.file
-        if doc_key and book.pages and book.pages > 0 then
-            local ok, _, err = API.put("/api/v1/koreader/syncs/progress", {
-                document   = doc_key,
-                progress   = tostring(book.page or 0),
-                percentage = (book.page or 0) / book.pages,
-                device     = "KOReader",
-            })
-            if ok then
-                sent = sent + 1
-            else
-                failed = failed + 1
-                logger.warn("BookOrbit: progress failed for " .. tostring(doc_key)
-                    .. ": " .. tostring(err))
-            end
+--[[
+    _doSyncAsync(books, since, on_done)
+
+    Processes books one per UIManager tick so the UI stays responsive.
+    on_done(results) is called when all books are finished.
+
+    Two passes:
+      1. progress PUT  (one per book)
+      2. stats   POST  (one per book)
+
+    Each HTTP call is wrapped in scheduleIn(0, ...) so KOReader can
+    repaint / handle input between them.
+--]]
+local function _doSyncAsync(books, since, on_done)
+    local progress_results = { ok = true, label = "progress", count = 0, failed = 0 }
+    local stats_results    = { ok = true, label = "stats",    count = 0, failed = 0 }
+
+    local n = #books
+
+    local function finish()
+        local results = {}
+
+        if progress_results.count > 0 or progress_results.failed > 0 then
+            results[#results + 1] = {
+                ok    = progress_results.ok,
+                label = "progress",
+                count = progress_results.count,
+                err   = progress_results.failed > 0
+                    and (progress_results.failed .. " failed") or nil,
+            }
         end
+
+        results[#results + 1] = {
+            ok    = stats_results.ok,
+            label = "stats",
+            count = stats_results.count,
+            err   = stats_results.failed > 0
+                and (stats_results.failed .. " failed") or nil,
+        }
+
+        S.setLastSync(os.time())
+        _syncing = false
+        on_done(results)
     end
-    return {
-        ok    = failed == 0,
-        label = "progress",
-        count = sent,
-        err   = failed > 0 and (failed .. " failed") or nil,
-    }
-end
 
+    -- pass 2: all stats in ONE batched POST, yielded one tick so UI can breathe first
+    local function doStatsPass()
+        UIManager:scheduleIn(0, function()
+            local payload = {}
+            local skipped = 0
 
-local function syncStats(books, since)
-    local sent, failed, skipped = 0, 0, 0
+            for _, book in ipairs(books) do
+                local doc_key = (book.md5 and book.md5 ~= "") and book.md5
+                    or (book.file and book.file ~= "") and book.file
 
-    for _, book in ipairs(books) do
-        local doc_key = (book.md5 and book.md5 ~= "") and book.md5
-            or (book.file and book.file ~= "") and book.file
-
-        if not doc_key then
-            skipped = skipped + 1
-            logger.warn("BookOrbit: skipping book with no md5 or file: "
-                .. tostring(book.title))
-        else
-            local ok, resp, err = API.post("/api/v1/koreader/stats", {
-                since     = since,
-                timestamp = os.time(),
-                device    = S.getUsername(),
-                books     = {
-                    {
+                if not doc_key then
+                    skipped = skipped + 1
+                    logger.warn("BookOrbit: skipping book with no md5 or file: "
+                        .. tostring(book.title))
+                else
+                    payload[#payload + 1] = {
                         document         = book.md5 or doc_key,
                         md5              = book.md5 or "",
                         title            = book.title or "",
@@ -201,66 +239,105 @@ local function syncStats(books, since)
                         total_read_pages = book.total_read_pages or 0,
                         page_sessions    = book.page_sessions or json.array(),
                     }
-                },
-            })
-
-            if ok then
-                sent = sent + 1
-                logger.info("BookOrbit: sent [" .. tostring(book.title) .. "]")
-            else
-                failed = failed + 1
-                logger.warn("BookOrbit: FAILED [" .. tostring(book.title)
-                    .. "] " .. tostring(err))
+                end
             end
+
+            if skipped > 0 then
+                logger.warn("BookOrbit: skipped " .. skipped .. " book(s) with no document key")
+            end
+
+            if #payload > 0 then
+                local ok, _, err = API.post("/api/v1/koreader/stats", {
+                    since     = since,
+                    timestamp = os.time(),
+                    device    = S.getUsername(),
+                    books     = payload,
+                })
+                if ok then
+                    stats_results.count = #payload
+                    logger.info("BookOrbit: stats batch sent (" .. #payload .. " books)")
+                else
+                    stats_results.ok     = false
+                    stats_results.failed = #payload
+                    logger.warn("BookOrbit: stats batch FAILED: " .. tostring(err))
+                end
+            end
+
+            finish()
+        end)
+    end
+
+    -- pass 1: progress PUT per book (one per tick — KOSync compat, no batch endpoint)
+    local function doProgressPass(i)
+        if i > n then
+            doStatsPass()
+            return
         end
+
+        UIManager:scheduleIn(0, function()
+            local book    = books[i]
+            local doc_key = (book.md5 and book.md5 ~= "") and book.md5
+                or (book.file and book.file ~= "") and book.file
+
+            if doc_key and book.pages and book.pages > 0 then
+                local ok, _, err = API.put("/api/v1/koreader/syncs/progress", {
+                    document   = doc_key,
+                    progress   = tostring(book.page or 0),
+                    percentage = (book.page or 0) / book.pages,
+                    device     = "KOReader",
+                })
+                if ok then
+                    progress_results.count = progress_results.count + 1
+                else
+                    progress_results.failed = progress_results.failed + 1
+                    progress_results.ok     = false
+                    logger.warn("BookOrbit: progress failed for " .. tostring(doc_key)
+                        .. ": " .. tostring(err))
+                end
+            end
+
+            doProgressPass(i + 1)
+        end)
     end
 
-    if skipped > 0 then
-        logger.warn("BookOrbit: skipped " .. skipped .. " book(s) with no document key")
-    end
-
-    logger.info(string.format(
-        "BookOrbit: stats done — sent=%d failed=%d skipped=%d",
-        sent, failed, skipped))
-
-    return {
-        ok    = failed == 0,
-        label = "stats",
-        count = sent,
-        err   = failed > 0 and (failed .. " failed") or nil,
-    }
+    doProgressPass(1)
 end
 
-local function _doSync(ui, since)
+
+local function _doSync(ui, since, on_done, live_session)
     if _syncing then
         logger.info("BookOrbit: sync already in progress, skipping")
-        return { { ok = true, label = "skipped (busy)", count = 0 } }
+        if on_done then
+            on_done({ { ok = true, label = "skipped (busy)", count = 0 } })
+        end
+        return
     end
     _syncing    = true
     local books = getBooks(since) or {}
-    books       = mergeOpenDoc(ui, books) or {}
+    books       = mergeOpenDoc(ui, books, live_session) or {}
     if #books == 0 then
         logger.info("BookOrbit: nothing to sync")
+        S.setLastSync(os.time())
         _syncing = false
-        return { { ok = true, label = "up to date", count = 0 } }
+        if on_done then
+            on_done({ { ok = true, label = "up to date", count = 0 } })
+        end
+        return
     end
     logger.info("BookOrbit: syncing " .. #books .. " book(s)")
-    local results = { syncProgress(books), syncStats(books, since) }
-    S.setLastSync(os.time())
-    _syncing = false
-    return results
+    _doSyncAsync(books, since, on_done or function() end)
 end
 
 
-function Sync.full(ui)
+function Sync.full(ui, on_done)
     logger.info("BookOrbit: full sync (since=0)")
-    return _doSync(ui, 0)
+    _doSync(ui, 0, on_done)
 end
 
-function Sync.delta(ui)
+function Sync.delta(ui, on_done, live_session)
     local since = S.getLastSync()
     logger.info("BookOrbit: delta sync since " .. since)
-    return _doSync(ui, since)
+    _doSync(ui, since, on_done, live_session)
 end
 
 Sync.tick = Sync.delta
@@ -285,17 +362,6 @@ function Sync.onNetworkUp(ui)
     if elapsed < 30 * 60 then return end
     logger.info("BookOrbit: sync on network up")
     Sync.delta(ui)
-end
-
-function Sync.onReadingTick(ui, pages, mins)
-    if not S.isConfigured() then return end
-    local page_due = S.getPageThreshold() > 0 and pages >= S.getPageThreshold()
-    local min_due  = S.getMinuteThreshold() > 0 and mins >= S.getMinuteThreshold()
-    if page_due or min_due then
-        logger.info("BookOrbit: auto-sync trigger (pages=" .. pages
-            .. " mins=" .. string.format("%.1f", mins) .. ")")
-        Sync.tick(ui)
-    end
 end
 
 return Sync
